@@ -1,0 +1,269 @@
+name: wokwi
+# either manually started, or on a schedule
+on: [ push, workflow_dispatch ]
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+jobs:
+  xls:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v2
+      - name: cache conda
+        uses: actions/cache@v2
+        env:
+          CACHE_NUMBER: 1
+        with:
+          path: ~/conda_pkgs_dir
+          key:
+            ${{ runner.os }}-conda-${{ env.CACHE_NUMBER }}-${{ hashFiles('environment.yml') }}
+      - name: setup miniconda
+        uses: conda-incubator/setup-miniconda@v2.1.1
+        with:
+          activate-environment: tinytapeout
+          channel-priority: strict
+          environment-file: environment.yml
+          use-only-tar-bz2: true
+      - name: update path
+        shell: bash -l {0}
+        run: |
+          echo $CONDA/envs/tinytapeout/bin >> $GITHUB_PATH
+      - name: run dslx test
+        run: |
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          # test
+
+          \`\`\`
+          `interpreter_main src/user_module.x 2>&1`
+          \`\`\`
+          EOF
+      - name: generate rtl
+        run: make generate
+      - name: add verilog to summary
+        run: |
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          # codegen
+
+          \`\`\`
+          `cat src/user_module.v`
+          \`\`\`
+          EOF
+      - name: populate rtl cache
+        uses: actions/cache@v2
+        with:
+          path: src
+          key: ${{ runner.os }}-rtl-${{ hashFiles('src/user_module.v') }}
+      - name: commit generated rtl
+        run: |
+          git config --local user.name "tinybot"
+          git config --local user.email "bot@tinytapeout.com"
+          git add src/user_module.v
+          git commit -m "src: generated user module [skip ci]"
+          git push origin main
+
+  gds:
+    needs: xls
+    env:
+      OPENLANE_TAG:   2022.02.23_02.50.41
+      OPENLANE_IMAGE_NAME:    efabless/openlane:$(OPENLANE_TAG)
+      OPENLANE_ROOT:  /home/runner/openlane
+      PDK_ROOT:       /home/runner/pdk
+      PDK:            sky130A
+
+    # ubuntu
+    runs-on: ubuntu-latest
+    steps:
+    # need the repo checked out
+    - name: checkout repo
+      uses: actions/checkout@v2
+
+    - name: checkout caravel_user_project
+      uses: actions/checkout@v2
+      with:
+        repository: efabless/caravel_user_project
+        ref: mpw-6c
+        path: caravel_user_project
+
+    - name: pdk & caravel
+      run: |
+        cd caravel_user_project
+        make setup
+
+    - name: restore rtl cache
+      uses: actions/cache@v2
+      with:
+        path: src
+        key: ${{ runner.os }}-rtl-${{ hashFiles('src/user_module.v') }}
+
+    - name: generate user module
+      run: make fetch
+
+    - name: make GDS
+      run: make harden
+
+    - name: show runs files
+      run: find runs/
+
+    - name: setup python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    - name: add summary
+      run: |
+        python << EOF >> $GITHUB_STEP_SUMMARY
+        import csv
+        with open('runs/wokwi/reports/final_summary_report.csv') as f:
+            report = list(csv.DictReader(f))[0]
+            keys = ['OpenDP_Util', 'cell_count', 'wire_length', 'AND', 'DFF', 'NAND', 'NOR', 'OR', 'XOR', 'XNOR', 'MUX']
+            print(f'| { "|".join(keys) } |')
+            print(f'| { "|".join(["-----"] * len(keys)) } |')
+            print(f'| { "|".join(report[k] for k in keys) } |')
+        EOF
+
+    - name: populate src cache
+      uses: actions/cache@v2
+      with:
+        path: src
+        key: ${{ runner.os }}-src-${{ github.run_id }}
+
+    - name: populate runs cache
+      uses: actions/cache@v2
+      with:
+        path: runs
+        key: ${{ runner.os }}-runs-${{ github.run_id }}
+
+  svg:
+    needs: gds
+    runs-on: ubuntu-latest
+    steps:
+    - name: checkout repo
+      uses: actions/checkout@v2
+    - name: setup python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    - name: install deps
+      uses: py-actions/py-dependency-install@v3
+      with:
+        path: 'requirements-svg.txt'
+    - name: restore runs cache
+      uses: actions/cache@v2
+      with:
+        path: runs
+        key: ${{ runner.os }}-runs-${{ github.run_id }}
+    - name: create svg
+      run: python view.py
+    - name: populate svg cache
+      uses: actions/cache@v2
+      with:
+        path: '*.svg'
+        key: ${{ runner.os }}-svg-${{ github.run_id }}
+
+  webgl:
+    needs: gds
+    runs-on: ubuntu-latest
+    steps:
+    - name: checkout repo
+      uses: actions/checkout@v2
+    - name: setup python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    - name: install deps
+      uses: py-actions/py-dependency-install@v3
+      with:
+        path: 'requirements-webgl.txt'
+    - name: restore runs cache
+      uses: actions/cache@v2
+      with:
+        path: runs
+        key: ${{ runner.os }}-runs-${{ github.run_id }}
+    # make html gds viewer with GDS2WebGL
+    - name: checkout repo
+      uses: actions/checkout@v2
+      with:
+        repository: s-holst/GDS2WebGL
+        path: GDS2WebGL
+    - name: GDS2WebGL
+      run: |
+        cd GDS2WebGL
+        python3 gds2webgl.py -i ../runs/wokwi/results/final/gds/*.gds -o ../index.html
+    - name: populate webgl cache
+      uses: actions/cache@v2
+      with:
+        path: index.html
+        key: ${{ runner.os }}-webgl-${{ github.run_id }}
+
+  artifact:
+    needs:
+    - gds
+    runs-on: ubuntu-latest
+    steps:
+    - name: restore src cache
+      uses: actions/cache@v2
+      with:
+        path: src
+        key: ${{ runner.os }}-src-${{ github.run_id }}
+    - name: restore runs cache
+      uses: actions/cache@v2
+      with:
+        path: runs
+        key: ${{ runner.os }}-runs-${{ github.run_id }}
+    - name: upload artifact
+      uses: actions/upload-artifact@v2
+      with:
+          # path depends on the tag and the module name
+          name: GDS
+          path: |
+            src/*
+            runs/wokwi/results/final/*
+            runs/wokwi/reports/final_summary_report.csv
+  pages:
+    needs:
+    - svg
+    - webgl
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+    - name: restore svg cache
+      uses: actions/cache@v2
+      with:
+        path: '*.svg'
+        key: ${{ runner.os }}-svg-${{ github.run_id }}
+    - name: restore webgl cache
+      uses: actions/cache@v2
+      with:
+        path: index.html
+        key: ${{ runner.os }}-webgl-${{ github.run_id }}
+    - name: Setup Pages
+      uses: actions/configure-pages@v2
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v1
+      with:
+        path: '.'
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v1
+  preview:
+    needs: pages
+    runs-on: ubuntu-latest
+    steps:
+    - name: add gds preview
+      run: |
+        PAGE_URL=${{ needs.pages.outputs.page_url }}
+        PAGE_URL=$(echo "$PAGE_URL" | sed -e 's/\/$//')
+        cat << EOF >> $GITHUB_STEP_SUMMARY
+        # svg
+
+        ![svg]($PAGE_URL/gds_render.svg)
+
+        # webgl
+
+        [open preview]($PAGE_URL)
+        EOF
